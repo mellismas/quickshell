@@ -190,12 +190,24 @@ static void initiate_authentication(
 	};
 
 	if (cancellable != nullptr) {
+		// The cancellable is polkit's and may be released before this request
+		// is deleted, so hold a reference of our own.
+		g_object_ref(cancellable);
 		request->handlerId = g_cancellable_connect(
 		    cancellable,
 		    reinterpret_cast<GCallback>(authentication_cancelled_cb),
 		    request,
 		    nullptr
 		);
+
+		// Already cancelled at connect time: the handler ran synchronously,
+		// found nothing to cancel (the request is not queued yet), and the
+		// id is 0. Refuse rather than start an authentication nobody wants.
+		if (request->handlerId == 0) {
+			request->cancel("Authentication request was cancelled.");
+			delete request;
+			return;
+		}
 	}
 
 	self->cb->initiateAuthentication(request);
@@ -215,6 +227,18 @@ namespace qs::service::polkit {
 // authentication request. Therefore, we do not mark them as const.
 // NOLINTBEGIN(readability-make-member-function-const)
 void AuthRequest::complete() { g_task_return_boolean(this->task, true); }
+
+AuthRequest::~AuthRequest() {
+	// g_signal_handler_disconnect rather than g_cancellable_disconnect: the
+	// request may be deleted from inside its own cancel handler, where
+	// g_cancellable_disconnect would block waiting for that handler to return.
+	if (this->cancellable != nullptr) {
+		if (this->handlerId != 0) g_signal_handler_disconnect(this->cancellable, this->handlerId);
+		g_object_unref(this->cancellable);
+	}
+
+	g_object_unref(this->task);
+}
 
 void AuthRequest::cancel(const QString& reason) {
 	auto utf8Reason = reason.toUtf8();

@@ -34,6 +34,13 @@ struct AuthRequest {
 	GCancellable* cancellable;
 	//! Callback handler ID for the cancellable.
 	gulong handlerId;
+
+	//! Disconnects the cancellable handler, drops the request's reference on
+	//! the cancellable, and releases the task. The cancellable is polkit's
+	//! and can outlive the request, so a handler left connected would fire
+	//! on freed memory; it can also die first, so the request holds a
+	//! reference of its own.
+	~AuthRequest();
 	//! Callbacks for the listener
 	ListenerCb* cb;
 

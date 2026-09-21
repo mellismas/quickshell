@@ -74,6 +74,10 @@ G_BEGIN_DECLS
 G_DECLARE_FINAL_TYPE(QsPolkitAgent, qs_polkit_agent, QS, POLKIT_AGENT, PolkitAgentListener)
 
 QsPolkitAgent* qs_polkit_agent_new(qs::service::polkit::ListenerCb* cb);
+//! Forget the callback object. The listener can outlive it (a registration
+//! in flight holds a reference to the listener, and polkit may still call
+//! it); every call into the callback after this is skipped.
+void qs_polkit_agent_detach(QsPolkitAgent* agent);
 void qs_polkit_agent_register(QsPolkitAgent* agent, const char* path);
 void qs_polkit_agent_unregister(QsPolkitAgent* agent);
 

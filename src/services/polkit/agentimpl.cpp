@@ -31,7 +31,12 @@ PolkitAgentImpl::PolkitAgentImpl(PolkitAgent* agent)
 	qs_polkit_agent_register(this->listener.get(), utf8Path.constData());
 }
 
-PolkitAgentImpl::~PolkitAgentImpl() { this->cancelAllRequests("PolkitAgent is being destroyed"); }
+PolkitAgentImpl::~PolkitAgentImpl() {
+	this->cancelAllRequests("PolkitAgent is being destroyed");
+	// The listener may outlive this object (a registration in flight holds
+	// a reference to it): forget the callback so nothing dispatches here.
+	qs_polkit_agent_detach(this->listener.get());
+}
 
 void PolkitAgentImpl::cancelAllRequests(const QString& reason) {
 	for (; !this->queuedRequests.empty(); this->queuedRequests.pop_back()) {
@@ -46,10 +51,17 @@ void PolkitAgentImpl::cancelAllRequests(const QString& reason) {
 		QObject::disconnect(flow, nullptr, this, nullptr);
 		this->bActiveFlow = nullptr;
 		flow->cancelAuthenticationRequest();
+		// The flow and its request live until the deferred delete runs, with
+		// the cancel handler still connected; a cancel in that window must
+		// not reach this object, which may be gone by then.
+		if (auto* req = flow->authRequest()) req->cb = nullptr;
 		flow->deleteLater();
 	}
 
-	if (this->bIsRegistered.value()) qs_polkit_agent_unregister(this->listener.get());
+	// A no-op without a registration handle, so the bIsRegistered gate
+	// bought nothing; a registration still in flight is stopped by the
+	// detach check in the registration callback.
+	qs_polkit_agent_unregister(this->listener.get());
 }
 
 PolkitAgentImpl* PolkitAgentImpl::tryGetOrCreate(PolkitAgent* agent) {
@@ -119,8 +131,9 @@ void PolkitAgentImpl::cancelAuthentication(AuthRequest* request) {
 	auto* flow = this->bActiveFlow.value();
 	if (flow && flow->authRequest() == request) {
 		flow->cancelFromAgent();
-	} else if (auto it = std::ranges::find(this->queuedRequests, request);
-	           it != this->queuedRequests.end())
+	} else if (
+	    auto it = std::ranges::find(this->queuedRequests, request); it != this->queuedRequests.end()
+	)
 	{
 		qCDebug(logPolkit) << "removing queued authentication request for action" << (*it)->actionId;
 		(*it)->cancel("Authentication request was cancelled");
@@ -172,6 +185,11 @@ void PolkitAgentImpl::finishAuthenticationRequest() {
 	                   << this->bActiveFlow.value()->actionId();
 
 	QObject::disconnect(this->bActiveFlow.value(), nullptr, this, nullptr);
+	// The finished flow's request outlives it until the deferred delete,
+	// with its cancel handler still connected; a cancel arriving in that
+	// window has nothing to act on and must not reach an object that may
+	// be gone by then.
+	if (auto* req = this->bActiveFlow.value()->authRequest()) req->cb = nullptr;
 	this->bActiveFlow.value()->deleteLater();
 	this->bActiveFlow = nullptr;
 

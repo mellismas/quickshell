@@ -80,6 +80,8 @@ QsPolkitAgent* qs_polkit_agent_new(qs::service::polkit::ListenerCb* cb) {
 	return self;
 }
 
+void qs_polkit_agent_detach(QsPolkitAgent* agent) { agent->cb = nullptr; }
+
 struct RegisterCbData {
 	GObjectRef<QsPolkitAgent> agent;
 	std::string path;
@@ -102,6 +104,15 @@ static void qs_polkit_agent_register_cb(GObject* /*unused*/, GAsyncResult* res, 
 
 	GError* error = nullptr;
 	auto* subject = polkit_unix_session_new_for_process_finish(res, &error);
+
+	if (data->agent->cb == nullptr) {
+		// The agent went away while the subject was being resolved: do not
+		// register a listener nobody will answer for.
+		qCDebug(logPolkitListener) << "agent detached before registration completed; not registering";
+		if (subject != nullptr) g_object_unref(subject);
+		g_clear_error(&error);
+		return;
+	}
 
 	if (subject == nullptr || error != nullptr) {
 		qCWarning(logPolkitListener) << "failed to create subject for listener:"
@@ -141,6 +152,8 @@ void qs_polkit_agent_unregister(QsPolkitAgent* agent) {
 
 static void authentication_cancelled_cb(GCancellable* /*unused*/, gpointer userData) {
 	auto* request = static_cast<qs::service::polkit::AuthRequest*>(userData);
+	// A request whose agent has gone has nobody to tell.
+	if (request->cb == nullptr) return;
 	request->cb->cancelAuthentication(request);
 }
 
@@ -159,6 +172,20 @@ static void initiate_authentication(
 	auto* self = QS_POLKIT_AGENT(listener);
 
 	auto* asyncResult = g_task_new(reinterpret_cast<GObject*>(self), nullptr, callback, userData);
+
+	if (self->cb == nullptr) {
+		// The agent is gone but the listener is still registered: refuse
+		// rather than dispatch into freed memory.
+		g_task_return_new_error(
+		    asyncResult,
+		    POLKIT_ERROR,
+		    POLKIT_ERROR_CANCELLED,
+		    "%s",
+		    "Authentication agent is gone."
+		);
+		g_object_unref(asyncResult);
+		return;
+	}
 
 	// Identities may be duplicated, so we use the hash to filter them out.
 	std::unordered_set<guint> identitySet;

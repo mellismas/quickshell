@@ -1,6 +1,7 @@
 #pragma once
 
 #include <qstring.h>
+#include <qvariant.h>
 
 #define POLKIT_AGENT_I_KNOW_API_IS_SUBJECT_TO_CHANGE
 // This causes a problem with variables of the name.
@@ -23,8 +24,12 @@ struct AuthRequest {
 	QString message;
 	//! Icon name according to the FreeDesktop specification. May be empty.
 	QString iconName;
-	// Details intentionally omitted because nothing seems to use them.
+	//! Cookie identifying the request to polkitd.
 	QString cookie;
+	//! Details attached to the request: polkitd's own (`polkit.caller-pid`,
+	//! `polkit.subject-pid`) and whatever the requesting program added
+	//! (`pkexec` adds `program` and `command_line`). String keys and values.
+	QVariantMap details;
 	//! List of users/groups that can be used for authentication.
 	std::vector<GObjectRef<PolkitIdentity>> identities;
 

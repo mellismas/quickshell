@@ -40,6 +40,16 @@ class AuthFlow
 	/// This is an internal identifier and not recommended to show to users.
 	Q_PROPERTY(QString cookie READ cookie CONSTANT);
 
+	/// Details attached to the request, as a map of string keys to string values.
+	///
+	/// polkitd adds `polkit.caller-pid`, the process that asked it for the
+	/// authorization as identified by that process's D-Bus credentials, and
+	/// `polkit.subject-pid`, the process the authorization is for, where it
+	/// can determine them. The requesting program may attach details of its
+	/// own; `pkexec` attaches `program` and `command_line`. Values under keys
+	/// the requesting program chose are that program's own claims.
+	Q_PROPERTY(QVariantMap details READ details CONSTANT);
+
 	/// The list of identities that may be used to authenticate.
 	///
 	/// Each identity may be a user or a group. You may select any of them to
@@ -100,6 +110,7 @@ public:
 	[[nodiscard]] const QString& iconName() const { return this->mRequest->iconName; };
 	[[nodiscard]] const QString& actionId() const { return this->mRequest->actionId; };
 	[[nodiscard]] const QString& cookie() const { return this->mRequest->cookie; };
+	[[nodiscard]] const QVariantMap& details() const { return this->mRequest->details; };
 	[[nodiscard]] const QList<Identity*>& identities() const { return this->mIdentities; };
 
 	[[nodiscard]] QBindable<Identity*> selectedIdentity() { return &this->bSelectedIdentity; };

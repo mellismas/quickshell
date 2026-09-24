@@ -11,4 +11,5 @@ private slots:
 	static void cancelAfterCompletion();
 	static void deleteFromCancelHandler();
 	static void alreadyCancelled();
+	static void requestAfterDetach();
 };

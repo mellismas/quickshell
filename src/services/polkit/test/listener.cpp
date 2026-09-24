@@ -215,4 +215,23 @@ void TestPolkitListener::alreadyCancelled() {
 	g_object_unref(listener);
 }
 
+// The listener can outlive its agent (a registration in flight holds it).
+// A request arriving after the agent is gone must be refused with a
+// cancelled task rather than handed to it.
+void TestPolkitListener::requestAfterDetach() {
+	auto agent = FakeAgent();
+	auto* listener = qs_polkit_agent_new(&agent);
+	auto polkit = FakePolkit(listener);
+
+	qs_polkit_agent_detach(listener);
+	polkit.begin();
+	iterate();
+
+	QVERIFY(agent.started.isEmpty());
+	QVERIFY(polkit.answered);
+	QVERIFY(polkit.cancelled);
+
+	g_object_unref(listener);
+}
+
 QTEST_GUILESS_MAIN(TestPolkitListener);

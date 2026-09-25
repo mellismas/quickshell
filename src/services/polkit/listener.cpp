@@ -11,6 +11,7 @@
 #include <polkit/polkit.h>
 #include <polkit/polkittypes.h>
 #include <polkitagent/polkitagent.h>
+#include <qcontainerfwd.h>
 #include <qlogging.h>
 #include <qloggingcategory.h>
 #include <unistd.h>
@@ -149,7 +150,7 @@ static void initiate_authentication(
     const gchar* actionId,
     const gchar* message,
     const gchar* iconName,
-    PolkitDetails* /*unused*/,
+    PolkitDetails* details,
     const gchar* cookie,
     GList* identities,
     GCancellable* cancellable,
@@ -174,6 +175,23 @@ static void initiate_authentication(
 		identityVector.emplace_back(identity);
 	}
 
+	// The details are the caller's and freed after we return, so they are
+	// copied too. Keys and values are both strings.
+	QVariantMap detailMap;
+	if (details != nullptr) {
+		auto* keys = polkit_details_get_keys(details);
+
+		if (keys != nullptr) {
+			// NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+			for (auto** key = keys; *key != nullptr; ++key) {
+				const auto* value = polkit_details_lookup(details, *key);
+				detailMap.insert(QString::fromUtf8(*key), QString::fromUtf8(value == nullptr ? "" : value));
+			}
+
+			g_strfreev(keys);
+		}
+	}
+
 	// The original strings are freed by the caller after we return, so we
 	// copy them into QStrings.
 	auto* request = new qs::service::polkit::AuthRequest {
@@ -181,6 +199,7 @@ static void initiate_authentication(
 	    .message = QString::fromUtf8(message),
 	    .iconName = QString::fromUtf8(iconName),
 	    .cookie = QString::fromUtf8(cookie),
+	    .details = std::move(detailMap),
 	    .identities = std::move(identityVector),
 
 	    .task = asyncResult,

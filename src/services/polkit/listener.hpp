@@ -15,6 +15,24 @@
 
 namespace qs::service::polkit {
 class ListenerCb;
+
+//! A handler connected to a GCancellable. Holds a reference on the
+//! cancellable and disconnects the handler when destroyed.
+class CancelConnection {
+public:
+	CancelConnection() = default;
+	~CancelConnection();
+	Q_DISABLE_COPY_MOVE(CancelConnection);
+
+	//! Connects `callback` to `cancellable`. Returns false if the cancellable
+	//! was already cancelled, in which case the callback has already run.
+	bool connect(GCancellable* cancellable, GCallback callback, gpointer data);
+
+private:
+	GObjectRef<GCancellable> cancellable;
+	gulong handlerId = 0;
+};
+
 //! All state that comes in from PolKit about an authentication request.
 struct AuthRequest {
 	//! The action ID that this session is for.
@@ -29,11 +47,11 @@ struct AuthRequest {
 	std::vector<GObjectRef<PolkitIdentity>> identities;
 
 	//! Implementation detail to mark authentication done.
-	GTask* task;
-	//! Implementation detail for requests cancelled by agent.
-	GCancellable* cancellable;
-	//! Callback handler ID for the cancellable.
-	gulong handlerId;
+	GObjectRef<GTask> task;
+	//! Implementation detail for requests cancelled by agent. The cancellable
+	//! is polkit's, so a handler left connected after the request is deleted
+	//! would run on freed memory.
+	CancelConnection cancelConnection;
 	//! Callbacks for the listener
 	ListenerCb* cb;
 

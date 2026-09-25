@@ -23,6 +23,7 @@ namespace {
 QS_LOGGING_CATEGORY(logPolkitListener, "quickshell.service.polkit.listener", QtWarningMsg);
 }
 
+using qs::service::polkit::G_OBJECT_NO_REF;
 using qs::service::polkit::GObjectRef;
 
 // This is mostly GObject code, we follow their naming conventions for improved
@@ -183,19 +184,26 @@ static void initiate_authentication(
 	    .cookie = QString::fromUtf8(cookie),
 	    .identities = std::move(identityVector),
 
-	    .task = asyncResult,
-	    .cancellable = cancellable,
-	    .handlerId = 0,
+	    .task = GObjectRef<GTask>(asyncResult, G_OBJECT_NO_REF),
+	    .cancelConnection = {},
 	    .cb = self->cb
 	};
 
 	if (cancellable != nullptr) {
-		request->handlerId = g_cancellable_connect(
+		auto connected = request->cancelConnection.connect(
 		    cancellable,
 		    reinterpret_cast<GCallback>(authentication_cancelled_cb),
-		    request,
-		    nullptr
+		    request
 		);
+
+		// Already cancelled at connect time: the handler ran synchronously and
+		// found nothing to cancel (the request is not queued yet). Refuse rather
+		// than start an authentication nobody wants.
+		if (!connected) {
+			request->cancel("Authentication request was cancelled.");
+			delete request;
+			return;
+		}
 	}
 
 	self->cb->initiateAuthentication(request);
@@ -210,16 +218,31 @@ static gboolean initiate_authentication_finish(
 }
 
 namespace qs::service::polkit {
+bool CancelConnection::connect(GCancellable* cancellable, GCallback callback, gpointer data) {
+	// libpolkit-agent releases the cancellable when the request is answered,
+	// which is before the request is deleted, so hold a reference of our own.
+	this->cancellable = GObjectRef(cancellable);
+	this->handlerId = g_cancellable_connect(cancellable, callback, data, nullptr);
+	return this->handlerId != 0;
+}
+
+CancelConnection::~CancelConnection() {
+	// g_signal_handler_disconnect rather than g_cancellable_disconnect: the
+	// request may be deleted from inside its own cancel handler, where
+	// g_cancellable_disconnect would block waiting for that handler to return.
+	if (this->handlerId != 0) g_signal_handler_disconnect(this->cancellable.get(), this->handlerId);
+}
+
 // While these functions can be const since they do not modify member variables,
 // they are logically non-const since they modify the state of the
 // authentication request. Therefore, we do not mark them as const.
 // NOLINTBEGIN(readability-make-member-function-const)
-void AuthRequest::complete() { g_task_return_boolean(this->task, true); }
+void AuthRequest::complete() { g_task_return_boolean(this->task.get(), true); }
 
 void AuthRequest::cancel(const QString& reason) {
 	auto utf8Reason = reason.toUtf8();
 	g_task_return_new_error(
-	    this->task,
+	    this->task.get(),
 	    POLKIT_ERROR,
 	    POLKIT_ERROR_CANCELLED,
 	    "%s",

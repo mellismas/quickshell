@@ -117,7 +117,10 @@ void PolkitAgentImpl::initiateAuthentication(AuthRequest* request) {
 
 	this->queuedRequests.emplace_back(request);
 
-	if (this->queuedRequests.size() == 1) {
+	// Activation pops the request it activates, so the queue is empty again
+	// after every activation and its size says nothing about whether a flow
+	// is in progress. Gate on the flow itself.
+	if (this->bActiveFlow.value() == nullptr) {
 		this->activateAuthenticationRequest();
 	}
 }
@@ -141,37 +144,42 @@ void PolkitAgentImpl::cancelAuthentication(AuthRequest* request) {
 }
 
 void PolkitAgentImpl::activateAuthenticationRequest() {
-	if (this->queuedRequests.empty()) return;
+	// Called only with no active flow. Walk the queue until a request can be
+	// activated: a request with no supported identities is answered and
+	// dropped here rather than returned on, which would leave the rest of
+	// the queue waiting for a flow that never starts.
+	while (!this->queuedRequests.empty()) {
+		AuthRequest* req = this->queuedRequests.front();
+		this->queuedRequests.pop_front();
+		qCDebug(logPolkit) << "activating authentication request for action" << req->actionId
+		                   << ", cookie: " << req->cookie;
 
-	AuthRequest* req = this->queuedRequests.front();
-	this->queuedRequests.pop_front();
-	qCDebug(logPolkit) << "activating authentication request for action" << req->actionId
-	                   << ", cookie: " << req->cookie;
+		QList<Identity*> identities;
+		for (auto& identity: req->identities) {
+			auto* obj = Identity::fromPolkitIdentity(identity);
+			if (obj) identities.append(obj);
+		}
+		if (identities.isEmpty()) {
+			qCWarning(
+			    logPolkit
+			) << "no supported identities available for authentication request, cancelling.";
+			req->cancel("Error requesting authentication: no supported identities available.");
+			delete req;
+			continue;
+		}
 
-	QList<Identity*> identities;
-	for (auto& identity: req->identities) {
-		auto* obj = Identity::fromPolkitIdentity(identity);
-		if (obj) identities.append(obj);
-	}
-	if (identities.isEmpty()) {
-		qCWarning(
-		    logPolkit
-		) << "no supported identities available for authentication request, cancelling.";
-		req->cancel("Error requesting authentication: no supported identities available.");
-		delete req;
+		this->bActiveFlow = new AuthFlow(req, std::move(identities));
+
+		QObject::connect(
+		    this->bActiveFlow.value(),
+		    &AuthFlow::isCompletedChanged,
+		    this,
+		    &PolkitAgentImpl::finishAuthenticationRequest
+		);
+
+		emit this->qmlAgent->authenticationRequestStarted();
 		return;
 	}
-
-	this->bActiveFlow = new AuthFlow(req, std::move(identities));
-
-	QObject::connect(
-	    this->bActiveFlow.value(),
-	    &AuthFlow::isCompletedChanged,
-	    this,
-	    &PolkitAgentImpl::finishAuthenticationRequest
-	);
-
-	emit this->qmlAgent->authenticationRequestStarted();
 }
 
 void PolkitAgentImpl::finishAuthenticationRequest() {
@@ -189,8 +197,7 @@ void PolkitAgentImpl::finishAuthenticationRequest() {
 	this->bActiveFlow.value()->deleteLater();
 	this->bActiveFlow = nullptr;
 
-	if (!this->queuedRequests.empty()) {
-		this->activateAuthenticationRequest();
-	}
+	// The flow is retired, so the next queued request, if any, can start.
+	this->activateAuthenticationRequest();
 }
 } // namespace qs::service::polkit

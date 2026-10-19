@@ -5,7 +5,9 @@
 #include <qlist.h>
 #include <qlogging.h>
 #include <qloggingcategory.h>
+#include <qnamespace.h>
 #include <qobject.h>
+#include <qobjectdefs.h>
 #include <qproperty.h>
 #include <qtmetamacros.h>
 
@@ -144,10 +146,15 @@ void PolkitAgentImpl::cancelAuthentication(AuthRequest* request) {
 }
 
 void PolkitAgentImpl::activateAuthenticationRequest() {
-	// Called only with no active flow. Walk the queue until a request can be
-	// activated: a request with no supported identities is answered and
-	// dropped here rather than returned on, which would leave the rest of
-	// the queue waiting for a flow that never starts.
+	// Runs from the event loop as well as from an incoming request, so a
+	// flow may be active already: a request that arrived before the queued
+	// call ran activated the head of the queue itself.
+	if (this->bActiveFlow.value() != nullptr) return;
+
+	// Walk the queue until a request can be activated: a request with no
+	// supported identities is answered and dropped here rather than returned
+	// on, which would leave the rest of the queue waiting for a flow that
+	// never starts.
 	while (!this->queuedRequests.empty()) {
 		AuthRequest* req = this->queuedRequests.front();
 		this->queuedRequests.pop_front();
@@ -197,7 +204,19 @@ void PolkitAgentImpl::finishAuthenticationRequest() {
 	this->bActiveFlow.value()->deleteLater();
 	this->bActiveFlow = nullptr;
 
-	// The flow is retired, so the next queued request, if any, can start.
-	this->activateAuthenticationRequest();
+	// The flow is retired, so the next queued request, if any, can start,
+	// but not from here. This runs from the flow's isCompletedChanged, which
+	// the flow emits inside a property update group, and bindings on the
+	// active flow (PolkitAgent.flow among them) are not re-evaluated until
+	// that group ends. Activating now would emit authenticationRequestStarted
+	// while QML still reads the finished flow. Activate from the event loop,
+	// after the group has closed and the bindings have settled.
+	if (!this->queuedRequests.empty()) {
+		QMetaObject::invokeMethod(
+		    this,
+		    &PolkitAgentImpl::activateAuthenticationRequest,
+		    Qt::QueuedConnection
+		);
+	}
 }
 } // namespace qs::service::polkit

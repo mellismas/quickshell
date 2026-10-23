@@ -11,6 +11,7 @@
 #include <polkit/polkit.h>
 #include <polkit/polkittypes.h>
 #include <polkitagent/polkitagent.h>
+#include <qcontainerfwd.h>
 #include <qlogging.h>
 #include <qloggingcategory.h>
 #include <unistd.h>
@@ -23,6 +24,7 @@ namespace {
 QS_LOGGING_CATEGORY(logPolkitListener, "quickshell.service.polkit.listener", QtWarningMsg);
 }
 
+using qs::service::polkit::G_OBJECT_NO_REF;
 using qs::service::polkit::GObjectRef;
 
 // This is mostly GObject code, we follow their naming conventions for improved
@@ -80,6 +82,8 @@ QsPolkitAgent* qs_polkit_agent_new(qs::service::polkit::ListenerCb* cb) {
 	return self;
 }
 
+void qs_polkit_agent_detach(QsPolkitAgent* agent) { agent->cb = nullptr; }
+
 struct RegisterCbData {
 	GObjectRef<QsPolkitAgent> agent;
 	std::string path;
@@ -102,6 +106,15 @@ static void qs_polkit_agent_register_cb(GObject* /*unused*/, GAsyncResult* res, 
 
 	GError* error = nullptr;
 	auto* subject = polkit_unix_session_new_for_process_finish(res, &error);
+
+	if (data->agent->cb == nullptr) {
+		// The agent went away while the subject was being resolved: do not
+		// register a listener nobody will answer for.
+		qCDebug(logPolkitListener) << "agent detached before registration completed; not registering";
+		if (subject != nullptr) g_object_unref(subject);
+		g_clear_error(&error);
+		return;
+	}
 
 	if (subject == nullptr || error != nullptr) {
 		qCWarning(logPolkitListener) << "failed to create subject for listener:"
@@ -141,6 +154,8 @@ void qs_polkit_agent_unregister(QsPolkitAgent* agent) {
 
 static void authentication_cancelled_cb(GCancellable* /*unused*/, gpointer userData) {
 	auto* request = static_cast<qs::service::polkit::AuthRequest*>(userData);
+	// A request whose agent has gone has nobody to tell.
+	if (request->cb == nullptr) return;
 	request->cb->cancelAuthentication(request);
 }
 
@@ -149,7 +164,7 @@ static void initiate_authentication(
     const gchar* actionId,
     const gchar* message,
     const gchar* iconName,
-    PolkitDetails* /*unused*/,
+    PolkitDetails* details,
     const gchar* cookie,
     GList* identities,
     GCancellable* cancellable,
@@ -159,6 +174,20 @@ static void initiate_authentication(
 	auto* self = QS_POLKIT_AGENT(listener);
 
 	auto* asyncResult = g_task_new(reinterpret_cast<GObject*>(self), nullptr, callback, userData);
+
+	if (self->cb == nullptr) {
+		// The agent is gone but the listener is still registered: refuse
+		// rather than dispatch into freed memory.
+		g_task_return_new_error(
+		    asyncResult,
+		    POLKIT_ERROR,
+		    POLKIT_ERROR_CANCELLED,
+		    "%s",
+		    "Authentication agent is gone."
+		);
+		g_object_unref(asyncResult);
+		return;
+	}
 
 	// Identities may be duplicated, so we use the hash to filter them out.
 	std::unordered_set<guint> identitySet;
@@ -174,6 +203,23 @@ static void initiate_authentication(
 		identityVector.emplace_back(identity);
 	}
 
+	// The details are the caller's and freed after we return, so they are
+	// copied too. Keys and values are both strings.
+	QVariantMap detailMap;
+	if (details != nullptr) {
+		auto* keys = polkit_details_get_keys(details);
+
+		if (keys != nullptr) {
+			// NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+			for (auto** key = keys; *key != nullptr; ++key) {
+				const auto* value = polkit_details_lookup(details, *key);
+				detailMap.insert(QString::fromUtf8(*key), QString::fromUtf8(value == nullptr ? "" : value));
+			}
+
+			g_strfreev(keys);
+		}
+	}
+
 	// The original strings are freed by the caller after we return, so we
 	// copy them into QStrings.
 	auto* request = new qs::service::polkit::AuthRequest {
@@ -181,21 +227,29 @@ static void initiate_authentication(
 	    .message = QString::fromUtf8(message),
 	    .iconName = QString::fromUtf8(iconName),
 	    .cookie = QString::fromUtf8(cookie),
+	    .details = std::move(detailMap),
 	    .identities = std::move(identityVector),
 
-	    .task = asyncResult,
-	    .cancellable = cancellable,
-	    .handlerId = 0,
+	    .task = GObjectRef<GTask>(asyncResult, G_OBJECT_NO_REF),
+	    .cancelConnection = {},
 	    .cb = self->cb
 	};
 
 	if (cancellable != nullptr) {
-		request->handlerId = g_cancellable_connect(
+		auto connected = request->cancelConnection.connect(
 		    cancellable,
 		    reinterpret_cast<GCallback>(authentication_cancelled_cb),
-		    request,
-		    nullptr
+		    request
 		);
+
+		// Already cancelled at connect time: the handler ran synchronously and
+		// found nothing to cancel (the request is not queued yet). Refuse rather
+		// than start an authentication nobody wants.
+		if (!connected) {
+			request->cancel("Authentication request was cancelled.");
+			delete request;
+			return;
+		}
 	}
 
 	self->cb->initiateAuthentication(request);
@@ -210,16 +264,31 @@ static gboolean initiate_authentication_finish(
 }
 
 namespace qs::service::polkit {
+bool CancelConnection::connect(GCancellable* cancellable, GCallback callback, gpointer data) {
+	// libpolkit-agent releases the cancellable when the request is answered,
+	// which is before the request is deleted, so hold a reference of our own.
+	this->cancellable = GObjectRef(cancellable);
+	this->handlerId = g_cancellable_connect(cancellable, callback, data, nullptr);
+	return this->handlerId != 0;
+}
+
+CancelConnection::~CancelConnection() {
+	// g_signal_handler_disconnect rather than g_cancellable_disconnect: the
+	// request may be deleted from inside its own cancel handler, where
+	// g_cancellable_disconnect would block waiting for that handler to return.
+	if (this->handlerId != 0) g_signal_handler_disconnect(this->cancellable.get(), this->handlerId);
+}
+
 // While these functions can be const since they do not modify member variables,
 // they are logically non-const since they modify the state of the
 // authentication request. Therefore, we do not mark them as const.
 // NOLINTBEGIN(readability-make-member-function-const)
-void AuthRequest::complete() { g_task_return_boolean(this->task, true); }
+void AuthRequest::complete() { g_task_return_boolean(this->task.get(), true); }
 
 void AuthRequest::cancel(const QString& reason) {
 	auto utf8Reason = reason.toUtf8();
 	g_task_return_new_error(
-	    this->task,
+	    this->task.get(),
 	    POLKIT_ERROR,
 	    POLKIT_ERROR_CANCELLED,
 	    "%s",

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <qstring.h>
+#include <qvariant.h>
 
 #define POLKIT_AGENT_I_KNOW_API_IS_SUBJECT_TO_CHANGE
 // This causes a problem with variables of the name.
@@ -15,6 +16,24 @@
 
 namespace qs::service::polkit {
 class ListenerCb;
+
+//! A handler connected to a GCancellable. Holds a reference on the
+//! cancellable and disconnects the handler when destroyed.
+class CancelConnection {
+public:
+	CancelConnection() = default;
+	~CancelConnection();
+	Q_DISABLE_COPY_MOVE(CancelConnection);
+
+	//! Connects `callback` to `cancellable`. Returns false if the cancellable
+	//! was already cancelled, in which case the callback has already run.
+	bool connect(GCancellable* cancellable, GCallback callback, gpointer data);
+
+private:
+	GObjectRef<GCancellable> cancellable;
+	gulong handlerId = 0;
+};
+
 //! All state that comes in from PolKit about an authentication request.
 struct AuthRequest {
 	//! The action ID that this session is for.
@@ -23,17 +42,20 @@ struct AuthRequest {
 	QString message;
 	//! Icon name according to the FreeDesktop specification. May be empty.
 	QString iconName;
-	// Details intentionally omitted because nothing seems to use them.
+	//! Cookie identifying the request to polkitd.
 	QString cookie;
+	//! Details attached to the request by polkitd and by the requesting
+	//! program. String keys and values, unfiltered.
+	QVariantMap details;
 	//! List of users/groups that can be used for authentication.
 	std::vector<GObjectRef<PolkitIdentity>> identities;
 
 	//! Implementation detail to mark authentication done.
-	GTask* task;
-	//! Implementation detail for requests cancelled by agent.
-	GCancellable* cancellable;
-	//! Callback handler ID for the cancellable.
-	gulong handlerId;
+	GObjectRef<GTask> task;
+	//! Implementation detail for requests cancelled by agent. The cancellable
+	//! is polkit's, so a handler left connected after the request is deleted
+	//! would run on freed memory.
+	CancelConnection cancelConnection;
 	//! Callbacks for the listener
 	ListenerCb* cb;
 
@@ -67,6 +89,10 @@ G_BEGIN_DECLS
 G_DECLARE_FINAL_TYPE(QsPolkitAgent, qs_polkit_agent, QS, POLKIT_AGENT, PolkitAgentListener)
 
 QsPolkitAgent* qs_polkit_agent_new(qs::service::polkit::ListenerCb* cb);
+//! Forget the callback object. The listener can outlive it (a registration
+//! in flight holds a reference to the listener, and polkit may still call
+//! it); every call into the callback after this is skipped.
+void qs_polkit_agent_detach(QsPolkitAgent* agent);
 void qs_polkit_agent_register(QsPolkitAgent* agent, const char* path);
 void qs_polkit_agent_unregister(QsPolkitAgent* agent);
 

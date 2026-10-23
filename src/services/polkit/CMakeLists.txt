@@ -33,3 +33,7 @@ target_link_libraries(quickshell-service-polkit PRIVATE
 qs_module_pch(quickshell-service-polkit)
 
 target_link_libraries(quickshell PRIVATE quickshell-service-polkitplugin)
+
+if (BUILD_TESTING)
+	add_subdirectory(test)
+endif()

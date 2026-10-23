@@ -5,7 +5,9 @@
 #include <qlist.h>
 #include <qlogging.h>
 #include <qloggingcategory.h>
+#include <qnamespace.h>
 #include <qobject.h>
+#include <qobjectdefs.h>
 #include <qproperty.h>
 #include <qtmetamacros.h>
 
@@ -31,7 +33,12 @@ PolkitAgentImpl::PolkitAgentImpl(PolkitAgent* agent)
 	qs_polkit_agent_register(this->listener.get(), utf8Path.constData());
 }
 
-PolkitAgentImpl::~PolkitAgentImpl() { this->cancelAllRequests("PolkitAgent is being destroyed"); }
+PolkitAgentImpl::~PolkitAgentImpl() {
+	this->cancelAllRequests("PolkitAgent is being destroyed");
+	// The listener may outlive this object (a registration in flight holds
+	// a reference to it): forget the callback so nothing dispatches here.
+	qs_polkit_agent_detach(this->listener.get());
+}
 
 void PolkitAgentImpl::cancelAllRequests(const QString& reason) {
 	for (; !this->queuedRequests.empty(); this->queuedRequests.pop_back()) {
@@ -46,6 +53,10 @@ void PolkitAgentImpl::cancelAllRequests(const QString& reason) {
 		QObject::disconnect(flow, nullptr, this, nullptr);
 		this->bActiveFlow = nullptr;
 		flow->cancelAuthenticationRequest();
+		// The flow and its request live until the deferred delete runs, with
+		// the cancel handler still connected; a cancel in that window must
+		// not reach this object, which may be gone by then.
+		if (auto* req = flow->authRequest()) req->cb = nullptr;
 		flow->deleteLater();
 	}
 
@@ -108,7 +119,10 @@ void PolkitAgentImpl::initiateAuthentication(AuthRequest* request) {
 
 	this->queuedRequests.emplace_back(request);
 
-	if (this->queuedRequests.size() == 1) {
+	// Activation pops the request it activates, so the queue is empty again
+	// after every activation and its size says nothing about whether a flow
+	// is in progress. Gate on the flow itself.
+	if (this->bActiveFlow.value() == nullptr) {
 		this->activateAuthenticationRequest();
 	}
 }
@@ -132,37 +146,47 @@ void PolkitAgentImpl::cancelAuthentication(AuthRequest* request) {
 }
 
 void PolkitAgentImpl::activateAuthenticationRequest() {
-	if (this->queuedRequests.empty()) return;
+	// Runs from the event loop as well as from an incoming request, so a
+	// flow may be active already: a request that arrived before the queued
+	// call ran activated the head of the queue itself.
+	if (this->bActiveFlow.value() != nullptr) return;
 
-	AuthRequest* req = this->queuedRequests.front();
-	this->queuedRequests.pop_front();
-	qCDebug(logPolkit) << "activating authentication request for action" << req->actionId
-	                   << ", cookie: " << req->cookie;
+	// Walk the queue until a request can be activated: a request with no
+	// supported identities is answered and dropped here rather than returned
+	// on, which would leave the rest of the queue waiting for a flow that
+	// never starts.
+	while (!this->queuedRequests.empty()) {
+		AuthRequest* req = this->queuedRequests.front();
+		this->queuedRequests.pop_front();
+		qCDebug(logPolkit) << "activating authentication request for action" << req->actionId
+		                   << ", cookie: " << req->cookie;
 
-	QList<Identity*> identities;
-	for (auto& identity: req->identities) {
-		auto* obj = Identity::fromPolkitIdentity(identity);
-		if (obj) identities.append(obj);
-	}
-	if (identities.isEmpty()) {
-		qCWarning(
-		    logPolkit
-		) << "no supported identities available for authentication request, cancelling.";
-		req->cancel("Error requesting authentication: no supported identities available.");
-		delete req;
+		QList<Identity*> identities;
+		for (auto& identity: req->identities) {
+			auto* obj = Identity::fromPolkitIdentity(identity);
+			if (obj) identities.append(obj);
+		}
+		if (identities.isEmpty()) {
+			qCWarning(
+			    logPolkit
+			) << "no supported identities available for authentication request, cancelling.";
+			req->cancel("Error requesting authentication: no supported identities available.");
+			delete req;
+			continue;
+		}
+
+		this->bActiveFlow = new AuthFlow(req, std::move(identities));
+
+		QObject::connect(
+		    this->bActiveFlow.value(),
+		    &AuthFlow::isCompletedChanged,
+		    this,
+		    &PolkitAgentImpl::finishAuthenticationRequest
+		);
+
+		emit this->qmlAgent->authenticationRequestStarted();
 		return;
 	}
-
-	this->bActiveFlow = new AuthFlow(req, std::move(identities));
-
-	QObject::connect(
-	    this->bActiveFlow.value(),
-	    &AuthFlow::isCompletedChanged,
-	    this,
-	    &PolkitAgentImpl::finishAuthenticationRequest
-	);
-
-	emit this->qmlAgent->authenticationRequestStarted();
 }
 
 void PolkitAgentImpl::finishAuthenticationRequest() {
@@ -172,11 +196,27 @@ void PolkitAgentImpl::finishAuthenticationRequest() {
 	                   << this->bActiveFlow.value()->actionId();
 
 	QObject::disconnect(this->bActiveFlow.value(), nullptr, this, nullptr);
+	// The finished flow's request outlives it until the deferred delete,
+	// with its cancel handler still connected; a cancel arriving in that
+	// window has nothing to act on and must not reach an object that may
+	// be gone by then.
+	if (auto* req = this->bActiveFlow.value()->authRequest()) req->cb = nullptr;
 	this->bActiveFlow.value()->deleteLater();
 	this->bActiveFlow = nullptr;
 
+	// The flow is retired, so the next queued request, if any, can start,
+	// but not from here. This runs from the flow's isCompletedChanged, which
+	// the flow emits inside a property update group, and bindings on the
+	// active flow (PolkitAgent.flow among them) are not re-evaluated until
+	// that group ends. Activating now would emit authenticationRequestStarted
+	// while QML still reads the finished flow. Activate from the event loop,
+	// after the group has closed and the bindings have settled.
 	if (!this->queuedRequests.empty()) {
-		this->activateAuthenticationRequest();
+		QMetaObject::invokeMethod(
+		    this,
+		    &PolkitAgentImpl::activateAuthenticationRequest,
+		    Qt::QueuedConnection
+		);
 	}
 }
 } // namespace qs::service::polkit

@@ -14,14 +14,19 @@
 
 QS_DECLARE_LOGGING_CATEGORY(logQsIntercept);
 
+class QmlScanner;
+
 class QsUrlInterceptor: public QQmlAbstractUrlInterceptor {
 public:
-	explicit QsUrlInterceptor(const QDir& configRoot): configRoot(configRoot) {}
+	QsUrlInterceptor(const QDir& configRoot, QmlScanner& scanner)
+	    : configRoot(configRoot)
+	    , scanner(scanner) {}
 
 	QUrl intercept(const QUrl& originalUrl, QQmlAbstractUrlInterceptor::DataType type) override;
 
 private:
 	QDir configRoot;
+	QmlScanner& scanner;
 };
 
 class QsInterceptDataReply: public QNetworkReply {

@@ -2,6 +2,7 @@
 #include <cstring>
 
 #include <qdir.h>
+#include <qfileinfo.h>
 #include <qhash.h>
 #include <qiodevice.h>
 #include <qlogging.h>
@@ -16,6 +17,7 @@
 #include <qurl.h>
 
 #include "logcat.hpp"
+#include "scan.hpp"
 
 QS_LOGGING_CATEGORY(logQsIntercept, "quickshell.interceptor", QtWarningMsg);
 
@@ -24,6 +26,13 @@ QUrl QsUrlInterceptor::intercept(
     QQmlAbstractUrlInterceptor::DataType type
 ) {
 	auto url = originalUrl;
+	if (this->scanner.omarchyLoadPatch && type == QQmlAbstractUrlInterceptor::DataType::QmlFile
+	    && url.isLocalFile())
+	{
+		auto path = QFileInfo(url.toLocalFile()).absoluteFilePath();
+		this->scanner.scanDir(QFileInfo(path).dir());
+		if (this->scanner.fileIntercepts.contains(path)) url.setScheme("qs");
+	}
 
 	if (url.scheme() == "root") {
 		url.setScheme("qs");

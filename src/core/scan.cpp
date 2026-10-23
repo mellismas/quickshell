@@ -14,6 +14,7 @@
 #include <qlogging.h>
 #include <qloggingcategory.h>
 #include <qpair.h>
+#include <qregularexpression.h>
 #include <qstring.h>
 #include <qtextstream.h>
 
@@ -21,6 +22,12 @@
 #include "scanenv.hpp"
 
 QS_LOGGING_CATEGORY(logQmlScanner, "quickshell.qmlscanner", QtWarningMsg);
+
+namespace {
+const auto unversionedQtQuickImport = QRegularExpression(
+    QStringLiteral(R"(^([ \t]*import[ \t]+QtQuick)(?=[ \t]*(?:as[ \t]|;|//|/\*|$)))")
+);
+} // namespace
 
 bool QmlScanner::readAndHashFile(const QString& path, QByteArray& data) {
 	auto file = QFile(path);
@@ -65,13 +72,19 @@ void QmlScanner::scanDir(const QDir& dir) {
 			) << "Found qmldir file, qmldir synthesization will be disabled for directory"
 			  << path;
 			seenQmldir = true;
-		} else if (name.at(0).isUpper() && name.endsWith(".qml")) {
-			auto& entry = entries.emplaceBack();
+		} else if (name.endsWith(".qml") && (this->omarchyLoadPatch || name.at(0).isUpper())) {
+			if (name.at(0).isUpper()) {
+				auto& entry = entries.emplaceBack();
 
-			if (this->scanQmlFile(dir.filePath(name), entry.singleton, entry.internal)) {
-				entry.name = name;
+				if (this->scanQmlFile(dir.filePath(name), entry.singleton, entry.internal)) {
+					entry.name = name;
+				} else {
+					entries.pop_back();
+				}
 			} else {
-				entries.pop_back();
+				bool singleton = false;
+				bool internal = false;
+				this->scanQmlFile(dir.filePath(name), singleton, internal);
 			}
 		} else if (name.at(0).isUpper() && name.endsWith(".qml.json")) {
 			if (this->scanQmlJson(dir.filePath(name))) {
@@ -121,9 +134,10 @@ void QmlScanner::scanDir(const QDir& dir) {
 		qCDebug(logQmlScanner) << "Synthesized qmldir for" << path << qPrintable("\n" + qmldir);
 		this->fileIntercepts.insert(QDir(path).filePath("qmldir"), qmldir);
 	}
+
 }
 
-bool QmlScanner::scanQmlFile(const QString& path, bool& singleton, bool& internal) {
+bool QmlScanner::scanQmlFile(const QString& path, bool& singleton, bool& internal, bool isRoot) {
 	if (this->scannedFiles.contains(path)) return false;
 	this->scannedFiles.push_back(path);
 
@@ -159,6 +173,9 @@ bool QmlScanner::scanQmlFile(const QString& path, bool& singleton, bool& interna
 		if (!sourceMasked && inHeader) {
 			if (!singleton && line == "pragma Singleton") {
 				singleton = true;
+			} else if (isRoot && line == "//@ pragma OmarchyLoadPatch") {
+				// Qt 6.12 added a QtQuick Color singleton which shadows Omarchy's Color singleton.
+				this->omarchyLoadPatch = true;
 			} else if (line.startsWith("import")) {
 				// we don't care about "import qs" as we always load the root folder
 				if (auto importCursor = line.indexOf(" qs."); importCursor != -1) {
@@ -226,6 +243,15 @@ bool QmlScanner::scanQmlFile(const QString& path, bool& singleton, bool& interna
 			}
 		}
 
+		if (!sourceMasked && this->omarchyLoadPatch) {
+			auto patchedLine =
+			    QString(rawLine).replace(unversionedQtQuickImport, QStringLiteral("\\1 6.11"));
+			if (patchedLine != rawLine) {
+				rawLine = patchedLine;
+				isOverridden = true;
+			}
+		}
+
 		if (!hideMask && sourceMasked) overrideText.append("// MASKED: " % rawLine % '\n');
 		else overrideText.append(rawLine % '\n');
 
@@ -285,7 +311,7 @@ bool QmlScanner::scanQmlFile(const QString& path, bool& singleton, bool& interna
 void QmlScanner::scanQmlRoot(const QString& path) {
 	bool singleton = false;
 	bool internal = false;
-	this->scanQmlFile(path, singleton, internal);
+	this->scanQmlFile(path, singleton, internal, true);
 }
 
 bool QmlScanner::scanQmlJson(const QString& path) {

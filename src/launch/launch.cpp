@@ -124,6 +124,8 @@ int launch(const LaunchArgs& args, char** argv) {
 				pragmas.stateDir = pragma.sliced(9).trimmed();
 			} else if (pragma.startsWith("CacheDir ")) {
 				pragmas.cacheDir = pragma.sliced(9).trimmed();
+			} else if (pragma == "OmarchyLoadPatch") {
+				// Applied later by the QML scanner.
 			} else {
 				qWarning() << "Unrecognized pragma" << pragma;
 			}

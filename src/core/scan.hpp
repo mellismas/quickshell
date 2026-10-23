@@ -25,6 +25,7 @@ public:
 	QVector<QString> scannedFiles;
 	QHash<QString, QByteArray> fileHashes;
 	QHash<QString, QString> fileIntercepts;
+	bool omarchyLoadPatch = false;
 
 	struct ScanError {
 		QString file;
@@ -40,7 +41,7 @@ public:
 private:
 	QDir rootPath;
 
-	bool scanQmlFile(const QString& path, bool& singleton, bool& internal);
+	bool scanQmlFile(const QString& path, bool& singleton, bool& internal, bool isRoot = false);
 	bool scanQmlJson(const QString& path);
 	[[nodiscard]] static QPair<QString, QString> jsonToQml(const QJsonValue& value, int indent = 0);
 
